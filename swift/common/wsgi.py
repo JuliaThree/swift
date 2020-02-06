@@ -30,6 +30,7 @@ import eventlet
 import eventlet.debug
 from eventlet import greenio, GreenPool, sleep, wsgi, listen, Timeout, \
     websocket
+from eventlet.zipkin import patcher as zipkin_patcher
 from paste.deploy import loadwsgi
 from eventlet.green import socket, ssl, os as green_os
 from io import BytesIO
@@ -650,6 +651,21 @@ def run_server(conf, logger, sock, global_conf=None):
     os.environ['TZ'] = 'UTC+0'
     time.tzset()
 
+    # Handle zipkin tracing (NOTE: we do this in workers, post-fork)
+    zipkin_scribe_host = conf.get("zipkin_scribe_host", "127.0.0.1")
+    zipkin_scribe_port = int(conf.get("zipkin_scribe_port", "9410"))
+    zipkin_sampling_rate = conf.get('zipkin_sampling_rate', '')
+    if zipkin_sampling_rate:  # non-empty string (which will be a float)
+        zipkin_sampling_rate = float(zipkin_sampling_rate)
+        logger.info("Worker PID=%d enabling Zipkin RPC tracing; host=%r; "
+                    "port=%d; sampling-rate=%.3f",
+                    os.getpid(), zipkin_scribe_host, zipkin_scribe_port,
+                    zipkin_sampling_rate)
+        zipkin_patcher.enable_trace_patch(
+            host=zipkin_scribe_host,
+            port=zipkin_scribe_port,
+            sampling_rate=zipkin_sampling_rate)
+
     wsgi.WRITE_TIMEOUT = int(conf.get('client_timeout') or 60)
 
     eventlet.hubs.use_hub(get_hub())
@@ -1138,7 +1154,7 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     # optional nice/ionice priority scheduling
     utils.modify_priority(conf, logger)
 
-    servers_per_port = int(conf.get('servers_per_port', '0') or 0)
+    servers_per_port = int(conf.get('servers_per_port', '0'))
 
     # NOTE: for now servers_per_port is object-server-only; future work could
     # be done to test and allow it to be used for account and container
