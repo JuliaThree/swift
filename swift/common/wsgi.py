@@ -652,8 +652,8 @@ def run_server(conf, logger, sock, global_conf=None):
     time.tzset()
 
     # Handle zipkin tracing (NOTE: we do this in workers, post-fork)
-    zipkin_scribe_host = conf.get("zipkin_scribe_host", "127.0.0.1")
-    zipkin_scribe_port = int(conf.get("zipkin_scribe_port", "9410"))
+    zipkin_scribe_host = conf.get("zipkin_v2_host", "127.0.0.1")
+    zipkin_scribe_port = int(conf.get("zipkin_v2_port", "9411"))
     zipkin_sampling_rate = conf.get('zipkin_sampling_rate', '')
     if zipkin_sampling_rate:  # non-empty string (which will be a float)
         zipkin_sampling_rate = float(zipkin_sampling_rate)

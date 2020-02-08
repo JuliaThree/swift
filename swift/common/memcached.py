@@ -54,6 +54,7 @@ from hashlib import md5
 
 from eventlet.green import socket
 from eventlet.pools import Pool
+from eventlet.zipkin import api
 from eventlet import Timeout
 from six.moves import range
 from swift.common import utils
@@ -150,6 +151,14 @@ class MemcacheConnPool(Pool):
             # An error happened previously, so we need a new connection
             fp, sock = self.create()
         return fp, sock
+
+
+def add_remote_endpoint(zipkin_span, server):
+    server_host, server_port = utils.parse_socket_string(
+        server, DEFAULT_MEMCACHED_PORT)
+    zipkin_span.add_remote_endpoint(port=int(server_port),
+                                    host=server_host,
+                                    service_name='memcached')
 
 
 class MemcacheRing(object):
@@ -266,6 +275,7 @@ class MemcacheRing(object):
                                  python-memcached interface. This
                                  implementation ignores it.
         """
+        orig_key = key
         key = md5hash(key)
         timeout = sanitize_timeout(time)
         flags = 0
@@ -281,15 +291,23 @@ class MemcacheRing(object):
             value = str(value).encode('utf-8')
 
         for (server, fp, sock) in self._get_conns(key):
-            try:
-                with Timeout(self._io_timeout):
-                    sock.sendall(set_msg(key, flags, timeout, value))
-                    # Wait for the set to complete
-                    fp.readline()
-                    self._return_conn(server, fp, sock)
-                    return
-            except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+            with api.ezipkin_client_span(
+                api.default_service_name(),
+                span_name='memcached.set',
+                binary_annotations={
+                    "memcached.key": orig_key,
+                },
+            ) as zipkin_span:
+                add_remote_endpoint(zipkin_span, server)
+                try:
+                    with Timeout(self._io_timeout):
+                        sock.sendall(set_msg(key, flags, timeout, value))
+                        # Wait for the set to complete
+                        fp.readline()
+                        self._return_conn(server, fp, sock)
+                        return
+                except (Exception, Timeout) as e:
+                    self._exception_occurred(server, e, sock=sock, fp=fp)
 
     def get(self, key):
         """
@@ -300,34 +318,44 @@ class MemcacheRing(object):
         :param key: key
         :returns: value of the key in memcache
         """
+        orig_key = key
         key = md5hash(key)
         value = None
         for (server, fp, sock) in self._get_conns(key):
-            try:
-                with Timeout(self._io_timeout):
-                    sock.sendall(b'get ' + key + b'\r\n')
-                    line = fp.readline().strip().split()
-                    while True:
-                        if not line:
-                            raise MemcacheConnectionError('incomplete read')
-                        if line[0].upper() == b'END':
-                            break
-                        if line[0].upper() == b'VALUE' and line[1] == key:
-                            size = int(line[3])
-                            value = fp.read(size)
-                            if int(line[2]) & PICKLE_FLAG:
-                                if self._allow_unpickle:
-                                    value = pickle.loads(value)
-                                else:
-                                    value = None
-                            elif int(line[2]) & JSON_FLAG:
-                                value = json.loads(value)
-                            fp.readline()
+            with api.ezipkin_client_span(
+                api.default_service_name(),
+                span_name='memcached.get',
+                binary_annotations={
+                    "memcached.key": orig_key,
+                },
+            ) as zipkin_span:
+                add_remote_endpoint(zipkin_span, server)
+                try:
+                    with Timeout(self._io_timeout):
+                        sock.sendall(b'get ' + key + b'\r\n')
                         line = fp.readline().strip().split()
-                    self._return_conn(server, fp, sock)
-                    return value
-            except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                        while True:
+                            if not line:
+                                raise MemcacheConnectionError(
+                                    'incomplete read')
+                            if line[0].upper() == b'END':
+                                break
+                            if line[0].upper() == b'VALUE' and line[1] == key:
+                                size = int(line[3])
+                                value = fp.read(size)
+                                if int(line[2]) & PICKLE_FLAG:
+                                    if self._allow_unpickle:
+                                        value = pickle.loads(value)
+                                    else:
+                                        value = None
+                                elif int(line[2]) & JSON_FLAG:
+                                    value = json.loads(value)
+                                fp.readline()
+                            line = fp.readline().strip().split()
+                        self._return_conn(server, fp, sock)
+                        return value
+                except (Exception, Timeout) as e:
+                    self._exception_occurred(server, e, sock=sock, fp=fp)
 
     def incr(self, key, delta=1, time=0):
         """
@@ -346,42 +374,56 @@ class MemcacheRing(object):
         :returns: result of incrementing
         :raises MemcacheConnectionError:
         """
+        orig_key = key
         key = md5hash(key)
         command = b'incr'
         if delta < 0:
             command = b'decr'
         delta = str(abs(int(delta))).encode('ascii')
         timeout = sanitize_timeout(time)
+        if delta >= 0:
+            span_name = 'memcached.incr'
+        else:
+            span_name = 'memcached.decr'
         for (server, fp, sock) in self._get_conns(key):
-            try:
-                with Timeout(self._io_timeout):
-                    sock.sendall(b' '.join([
-                        command, key, delta]) + b'\r\n')
-                    line = fp.readline().strip().split()
-                    if not line:
-                        raise MemcacheConnectionError('incomplete read')
-                    if line[0].upper() == b'NOT_FOUND':
-                        add_val = delta
-                        if command == b'decr':
-                            add_val = b'0'
+            with api.ezipkin_client_span(
+                api.default_service_name(),
+                span_name=span_name,
+                binary_annotations={
+                    "memcached.key": orig_key,
+                },
+            ) as zipkin_span:
+                add_remote_endpoint(zipkin_span, server)
+                try:
+                    with Timeout(self._io_timeout):
                         sock.sendall(b' '.join([
-                            b'add', key, b'0', str(timeout).encode('ascii'),
-                            str(len(add_val)).encode('ascii')
-                        ]) + b'\r\n' + add_val + b'\r\n')
+                            command, key, delta]) + b'\r\n')
                         line = fp.readline().strip().split()
-                        if line[0].upper() == b'NOT_STORED':
+                        if not line:
+                            raise MemcacheConnectionError('incomplete read')
+                        if line[0].upper() == b'NOT_FOUND':
+                            add_val = delta
+                            if command == b'decr':
+                                add_val = b'0'
                             sock.sendall(b' '.join([
-                                command, key, delta]) + b'\r\n')
+                                b'add', key, b'0',
+                                str(timeout).encode('ascii'),
+                                str(len(add_val)).encode('ascii')
+                            ]) + b'\r\n' + add_val + b'\r\n')
                             line = fp.readline().strip().split()
-                            ret = int(line[0].strip())
+                            if line[0].upper() == b'NOT_STORED':
+                                sock.sendall(b' '.join([
+                                    command, key, delta]) + b'\r\n')
+                                line = fp.readline().strip().split()
+                                ret = int(line[0].strip())
+                            else:
+                                ret = int(add_val)
                         else:
-                            ret = int(add_val)
-                    else:
-                        ret = int(line[0].strip())
-                    self._return_conn(server, fp, sock)
-                    return ret
-            except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                            ret = int(line[0].strip())
+                        self._return_conn(server, fp, sock)
+                        return ret
+                except (Exception, Timeout) as e:
+                    self._exception_occurred(server, e, sock=sock, fp=fp)
         raise MemcacheConnectionError("No Memcached connections succeeded.")
 
     def decr(self, key, delta=1, time=0):
@@ -405,17 +447,26 @@ class MemcacheRing(object):
 
         :param key: key to be deleted
         """
+        orig_key = key
         key = md5hash(key)
         for (server, fp, sock) in self._get_conns(key):
-            try:
-                with Timeout(self._io_timeout):
-                    sock.sendall(b'delete ' + key + b'\r\n')
-                    # Wait for the delete to complete
-                    fp.readline()
-                    self._return_conn(server, fp, sock)
-                    return
-            except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+            with api.ezipkin_client_span(
+                api.default_service_name(),
+                span_name='memcached.delete',
+                binary_annotations={
+                    "memcached.key": orig_key,
+                },
+            ) as zipkin_span:
+                add_remote_endpoint(zipkin_span, server)
+                try:
+                    with Timeout(self._io_timeout):
+                        sock.sendall(b'delete ' + key + b'\r\n')
+                        # Wait for the delete to complete
+                        fp.readline()
+                        self._return_conn(server, fp, sock)
+                        return
+                except (Exception, Timeout) as e:
+                    self._exception_occurred(server, e, sock=sock, fp=fp)
 
     def set_multi(self, mapping, server_key, serialize=True, time=0,
                   min_compress_len=0):
@@ -434,6 +485,7 @@ class MemcacheRing(object):
                            python-memcached interface. This implementation
                            ignores it
         """
+        orig_key = server_key
         server_key = md5hash(server_key)
         timeout = sanitize_timeout(time)
         msg = []
@@ -450,16 +502,24 @@ class MemcacheRing(object):
                 flags |= JSON_FLAG
             msg.append(set_msg(key, flags, timeout, value))
         for (server, fp, sock) in self._get_conns(server_key):
-            try:
-                with Timeout(self._io_timeout):
-                    sock.sendall(b''.join(msg))
-                    # Wait for the set to complete
-                    for line in range(len(mapping)):
-                        fp.readline()
-                    self._return_conn(server, fp, sock)
-                    return
-            except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+            with api.ezipkin_client_span(
+                api.default_service_name(),
+                span_name='memcached.set_multi',
+                binary_annotations={
+                    "memcached.key": orig_key,
+                },
+            ) as zipkin_span:
+                add_remote_endpoint(zipkin_span, server)
+                try:
+                    with Timeout(self._io_timeout):
+                        sock.sendall(b''.join(msg))
+                        # Wait for the set to complete
+                        for line in range(len(mapping)):
+                            fp.readline()
+                        self._return_conn(server, fp, sock)
+                        return
+                except (Exception, Timeout) as e:
+                    self._exception_occurred(server, e, sock=sock, fp=fp)
 
     def get_multi(self, keys, server_key):
         """
@@ -470,39 +530,49 @@ class MemcacheRing(object):
                            is used
         :returns: list of values
         """
+        orig_key = server_key
         server_key = md5hash(server_key)
         keys = [md5hash(key) for key in keys]
         for (server, fp, sock) in self._get_conns(server_key):
-            try:
-                with Timeout(self._io_timeout):
-                    sock.sendall(b'get ' + b' '.join(keys) + b'\r\n')
-                    line = fp.readline().strip().split()
-                    responses = {}
-                    while True:
-                        if not line:
-                            raise MemcacheConnectionError('incomplete read')
-                        if line[0].upper() == b'END':
-                            break
-                        if line[0].upper() == b'VALUE':
-                            size = int(line[3])
-                            value = fp.read(size)
-                            if int(line[2]) & PICKLE_FLAG:
-                                if self._allow_unpickle:
-                                    value = pickle.loads(value)
-                                else:
-                                    value = None
-                            elif int(line[2]) & JSON_FLAG:
-                                value = json.loads(value)
-                            responses[line[1]] = value
-                            fp.readline()
+            with api.ezipkin_client_span(
+                api.default_service_name(),
+                span_name='memcached.get_multi',
+                binary_annotations={
+                    "memcached.key": orig_key,
+                },
+            ) as zipkin_span:
+                add_remote_endpoint(zipkin_span, server)
+                try:
+                    with Timeout(self._io_timeout):
+                        sock.sendall(b'get ' + b' '.join(keys) + b'\r\n')
                         line = fp.readline().strip().split()
-                    values = []
-                    for key in keys:
-                        if key in responses:
-                            values.append(responses[key])
-                        else:
-                            values.append(None)
-                    self._return_conn(server, fp, sock)
-                    return values
-            except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                        responses = {}
+                        while True:
+                            if not line:
+                                raise MemcacheConnectionError(
+                                    'incomplete read')
+                            if line[0].upper() == b'END':
+                                break
+                            if line[0].upper() == b'VALUE':
+                                size = int(line[3])
+                                value = fp.read(size)
+                                if int(line[2]) & PICKLE_FLAG:
+                                    if self._allow_unpickle:
+                                        value = pickle.loads(value)
+                                    else:
+                                        value = None
+                                elif int(line[2]) & JSON_FLAG:
+                                    value = json.loads(value)
+                                responses[line[1]] = value
+                                fp.readline()
+                            line = fp.readline().strip().split()
+                        values = []
+                        for key in keys:
+                            if key in responses:
+                                values.append(responses[key])
+                            else:
+                                values.append(None)
+                        self._return_conn(server, fp, sock)
+                        return values
+                except (Exception, Timeout) as e:
+                    self._exception_occurred(server, e, sock=sock, fp=fp)
